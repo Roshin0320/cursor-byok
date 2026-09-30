@@ -24,6 +24,7 @@ pub use registry::{
     ImportResponse, InstallPluginResponse, OAuthBeginResponse, OAuthPollResponse, PluginRegistry,
 };
 pub use runtime::{PluginRuntime, PluginRuntimePhase, PluginRuntimeState, PluginRuntimeStatus};
+pub use state::ResourceSelection;
 
 /// Windows 下阻止 Deno 子进程弹出控制台窗口(CREATE_NO_WINDOW)。
 #[cfg(windows)]

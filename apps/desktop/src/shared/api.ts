@@ -216,6 +216,7 @@ export interface PluginResourceMetric {
   unit: "percent" | "count";
   value: number;
   resetAtMs?: number | null;
+  expiresAtMs?: number | null;
 }
 
 export interface PluginResourceView {
@@ -271,7 +272,14 @@ export interface PluginResourceActionResult {
   cards: PluginResourceActionCard[];
 }
 
+export interface PluginResourceSelection {
+  activeResourceId: string | null;
+  automaticSwitching: boolean;
+  revision: number;
+}
+
 export interface PluginResourceDescriptor {
+  selection: PluginResourceSelection;
   type: string;
   displayName: PluginLocalizedText;
   add: PluginAddMethod[];
@@ -520,6 +528,7 @@ export const api = {
     return invoke<string | null>("pick_plugin_directory", { title });
   },
   installPlugin: (path: string, replace: boolean) => request<PluginInstallResult>("/plugins/install", { method: "POST", body: JSON.stringify({ path, replace }) }),
+  setPluginResourceSelection: (pluginId: string, resourceType: string, selection: Omit<PluginResourceSelection, "revision">) => request<PluginResourceSelection>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/selection`, { method: "PUT", body: JSON.stringify(selection) }),
   pluginOAuthBegin: (pluginId: string, resourceType: string, methodId: string) => request<PluginOAuthBegin>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/add/${encodeURIComponent(methodId)}/begin`, { method: "POST" }),
   pluginOAuthPoll: (sessionId: string, signal?: AbortSignal) => request<PluginOAuthPoll>(`/plugins/oauth/${encodeURIComponent(sessionId)}/poll`, { method: "POST", signal }),
   importPluginResources: (pluginId: string, resourceType: string, files: PluginImportFile[]) => request<PluginImportResult>(`/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceType)}/import`, { method: "POST", body: JSON.stringify(files) }),
