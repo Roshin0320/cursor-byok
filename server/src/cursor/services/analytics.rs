@@ -14,7 +14,8 @@ use crate::{api::cursor::proxy, Error, Result};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
 const AGENT_RETRIES_GATE: &str = "nal_agent_retries";
-const LOCAL_RULE: &str = "local_enabled";
+const LOCAL_AGENT_LOOP_GATE: &str = "agent_host_local_loop";
+const LOCAL_RULE: &str = "local_override";
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapStatsigResponse {
@@ -51,7 +52,7 @@ fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
     let (framed, payload) = unary_payload(&response.body)?;
     let mut message = BootstrapStatsigResponse::decode(payload)?;
     let mut config = serde_json::from_str::<Value>(&message.config)?;
-    enable_agent_retries(&mut config)?;
+    configure_agent_runtime(&mut config)?;
     message.config = serde_json::to_string(&config)?;
     Ok(response.with_body(encode_unary(&message, framed)))
 }
@@ -74,7 +75,7 @@ fn local_response() -> Result<Response<Body>> {
         },
         "time": generated_at_ms
     });
-    enable_agent_retries(&mut config)?;
+    configure_agent_runtime(&mut config)?;
     let message = BootstrapStatsigResponse {
         config: serde_json::to_string(&config)?,
         generated_at_ms,
@@ -96,8 +97,10 @@ fn local_response() -> Result<Response<Body>> {
     Ok(response)
 }
 
-fn enable_agent_retries(config: &mut Value) -> Result<()> {
-    let gate_key = statsig_key(config, AGENT_RETRIES_GATE);
+fn configure_agent_runtime(config: &mut Value) -> Result<()> {
+    // BYOK owns the agent loop; Cursor's local loop sends RunInference instead of AgentRunRequest.
+    let overrides = [(AGENT_RETRIES_GATE, true), (LOCAL_AGENT_LOOP_GATE, false)]
+        .map(|(name, value)| (statsig_key(config, name), value));
     let root = config
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig bootstrap config must be an object".into()))?;
@@ -106,7 +109,9 @@ fn enable_agent_retries(config: &mut Value) -> Result<()> {
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig feature_gates must be an object".into()))?;
-    gates.insert(gate_key.clone(), enabled_gate(&gate_key));
+    for (key, value) in overrides {
+        gates.insert(key.clone(), gate(&key, value));
+    }
     Ok(())
 }
 
@@ -127,10 +132,10 @@ fn djb2(value: &str) -> String {
         .to_string()
 }
 
-fn enabled_gate(name: &str) -> Value {
+fn gate(name: &str, value: bool) -> Value {
     json!({
         "name": name,
-        "value": true,
+        "value": value,
         "rule_id": LOCAL_RULE,
         "ruleID": LOCAL_RULE,
         "group_name": LOCAL_RULE,
@@ -173,4 +178,72 @@ fn encode_unary(message: &impl Message, framed: bool) -> Bytes {
     output.put_u32(payload.len() as u32);
     output.extend_from_slice(&payload);
     output.freeze()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bootstrap_selects_the_backend_agent_loop_for_all_gate_hash_formats() {
+        for hash in ["none", "djb2", "sha256"] {
+            for framed in [false, true] {
+                let mut config = json!({
+                    "hash_used": hash,
+                    "feature_gates": {},
+                    "dynamic_configs": { "unrelated": { "value": 42 } },
+                    "user": { "userID": "test-user" }
+                });
+                let loop_key = statsig_key(&config, LOCAL_AGENT_LOOP_GATE);
+                let retries_key = statsig_key(&config, AGENT_RETRIES_GATE);
+                config["feature_gates"][&loop_key] = gate(&loop_key, true);
+                config["feature_gates"][&retries_key] = gate(&retries_key, false);
+                config["feature_gates"]["unrelated"] = gate("unrelated", true);
+                let message = BootstrapStatsigResponse {
+                    config: config.to_string(),
+                    generated_at_ms: 123,
+                };
+                let response = patch_upstream(proxy::BufferedResponse {
+                    status: StatusCode::OK,
+                    headers: Default::default(),
+                    body: encode_unary(&message, framed),
+                })
+                .unwrap();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let (actual_framed, payload) = unary_payload(&body).unwrap();
+                let message = BootstrapStatsigResponse::decode(payload).unwrap();
+                let patched: Value = serde_json::from_str(&message.config).unwrap();
+
+                assert_eq!(actual_framed, framed);
+                assert_eq!(message.generated_at_ms, 123);
+                assert_eq!(patched["feature_gates"][&loop_key]["value"], false);
+                assert_eq!(patched["feature_gates"][&retries_key]["value"], true);
+                assert_eq!(patched["feature_gates"].as_object().unwrap().len(), 3);
+                assert_eq!(
+                    patched["feature_gates"]["unrelated"],
+                    config["feature_gates"]["unrelated"]
+                );
+                assert_eq!(patched["dynamic_configs"], config["dynamic_configs"]);
+                assert_eq!(patched["user"], config["user"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_bootstrap_also_selects_the_backend_agent_loop() {
+        let response = local_response().unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = BootstrapStatsigResponse::decode(body).unwrap();
+        let config: Value = serde_json::from_str(&message.config).unwrap();
+
+        assert_eq!(
+            config["feature_gates"][LOCAL_AGENT_LOOP_GATE]["value"],
+            false
+        );
+        assert_eq!(config["feature_gates"][AGENT_RETRIES_GATE]["value"], true);
+    }
 }

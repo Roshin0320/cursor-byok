@@ -8,6 +8,23 @@ use crate::{
 
 use super::{now_ms, Store};
 
+// Keep the small lineage outermost; SQLite may otherwise scan every checkpoint's messages.
+const CHECKPOINT_MESSAGES_SQL: &str = "
+    WITH RECURSIVE lineage(checkpoint_id, parent_checkpoint_id, depth) AS (
+        SELECT checkpoint_id, parent_checkpoint_id, 0
+        FROM conversation_checkpoints WHERE checkpoint_id = ?
+        UNION ALL
+        SELECT r.checkpoint_id, r.parent_checkpoint_id, lineage.depth + 1
+        FROM conversation_checkpoints r
+        JOIN lineage ON r.checkpoint_id = lineage.parent_checkpoint_id
+    )
+    SELECT m.payload_json
+    FROM lineage
+    CROSS JOIN checkpoint_messages rm ON rm.checkpoint_id = lineage.checkpoint_id
+    CROSS JOIN messages m
+      ON m.conversation_id = rm.conversation_id AND m.message_id = rm.message_id
+    ORDER BY lineage.depth DESC, rm.ordinal ASC";
+
 impl Store {
     pub async fn message(
         &self,
@@ -78,28 +95,71 @@ impl Store {
         tx: &mut Transaction<'_, Sqlite>,
         checkpoint_id: i64,
     ) -> Result<Vec<CanonicalMessage>> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE lineage(checkpoint_id, parent_checkpoint_id, depth) AS (
-                 SELECT checkpoint_id, parent_checkpoint_id, 0
-                 FROM conversation_checkpoints WHERE checkpoint_id = ?
-                 UNION ALL
-                 SELECT r.checkpoint_id, r.parent_checkpoint_id, lineage.depth + 1
-                 FROM conversation_checkpoints r
-                 JOIN lineage ON r.checkpoint_id = lineage.parent_checkpoint_id
-             )
-             SELECT m.payload_json
-             FROM lineage
-             JOIN checkpoint_messages rm ON rm.checkpoint_id = lineage.checkpoint_id
-             JOIN messages m
-               ON m.conversation_id = rm.conversation_id AND m.message_id = rm.message_id
-             ORDER BY lineage.depth DESC, rm.ordinal ASC",
-        )
-        .bind(checkpoint_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let rows = sqlx::query(CHECKPOINT_MESSAGES_SQL)
+            .bind(checkpoint_id)
+            .fetch_all(&mut **tx)
+            .await?;
         rows.into_iter()
             .map(|row| serde_json::from_str(row.get::<&str, _>(0)).map_err(Into::into))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Origin, Role};
+
+    #[tokio::test]
+    async fn checkpoint_history_uses_indexed_lookups_and_preserves_lineage_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        let conversation = ConversationId::new("history");
+        let first = CanonicalMessage::text("first", Role::User, Origin::User, "first");
+        let second = CanonicalMessage::text("second", Role::Assistant, Origin::Assistant, "second");
+        let base = store
+            .import_checkpoint(&conversation, std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET current_checkpoint_id = ? WHERE conversation_id = ?")
+            .bind(base.0)
+            .bind(conversation.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let expected = vec![first.clone(), second];
+        let head = store
+            .import_checkpoint(&conversation, &expected)
+            .await
+            .unwrap();
+        let unrelated = ConversationId::new("unrelated");
+        store
+            .import_checkpoint(&unrelated, std::slice::from_ref(&first))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load_checkpoint_messages(head).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            store.load_checkpoint_messages(base).await.unwrap(),
+            vec![first]
+        );
+        let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {CHECKPOINT_MESSAGES_SQL}"))
+            .bind(head.0)
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+        let details: Vec<String> = plan.iter().map(|row| row.get("detail")).collect();
+        assert!(
+            details.iter().any(
+                |detail| detail.starts_with("SEARCH rm ") && detail.contains("checkpoint_id=?")
+            ),
+            "checkpoint history must use indexed lookups: {details:?}"
+        );
+        assert!(!details.iter().any(|detail| detail.starts_with("SCAN rm")));
     }
 }
 
