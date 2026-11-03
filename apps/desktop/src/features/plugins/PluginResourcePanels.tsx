@@ -230,6 +230,7 @@ export function PluginSettingsPanel({ plugin }: { plugin: PluginDescriptor }) {
       resource={resource}
       manager={manager}
       onAction={(item, action) => openResourceAction(resource, item, action)}
+      sourceIds={plugin.providers.filter((provider) => provider.resourceType === resource.type).map((provider) => `${plugin.id}/${provider.id}`)}
     />)}
     {manager.snapshotError && <span className={styles.error} role="alert">{t("本地状态同步失败：{error}", { error: manager.snapshotError })}</span>}
     {error && <span className={styles.error} role="alert">{error}</span>}

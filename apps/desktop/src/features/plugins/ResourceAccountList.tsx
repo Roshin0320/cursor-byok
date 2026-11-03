@@ -4,7 +4,7 @@ import { useI18n } from "../../i18n/store";
 import { appStore, useAppStore } from "../../shared/store/appStore";
 import { Button } from "../../shared/ui/Button";
 import { Card } from "../../shared/ui/Card";
-import { ConfirmDialog } from "../../shared/ui/ConfirmDialog";
+import { SourceDeleteDialog } from "../aliases/SourceDeleteDialog";
 import { FormField, TextInput } from "../../shared/ui/FormControls";
 import { Switch } from "../../shared/ui/Switch";
 import { remainingSeconds, resourceKey, showsMetricDeadline } from "./accountLifecycle";
@@ -13,8 +13,9 @@ import styles from "./PluginResourcePanels.module.scss";
 
 const PAGE_SIZE = 10;
 
-export function ResourceAccountList({ pluginId, resource, manager, onAction }: {
+export function ResourceAccountList({ pluginId, resource, manager, onAction, sourceIds }: {
   pluginId: string;
+  sourceIds: string[];
   resource: PluginResourceDescriptor;
   manager: ReturnType<typeof useAccountManager>;
   onAction: (item: PluginResourceView, action: PluginResourceAction) => void;
@@ -79,10 +80,10 @@ export function ResourceAccountList({ pluginId, resource, manager, onAction }: {
         <Button size="small" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}>{t("下一页")}</Button>
       </div>}
     </div>
-    {pendingDelete && <ConfirmDialog
-      open
+    {pendingDelete && <SourceDeleteDialog
       title={t("删除账号")}
-      confirmLabel={t("删除")}
+      sourceType="plugin"
+      sourceIds={sourceIds}
       busy={Boolean(manager.tasks[resourceKey(resource.type, pendingDelete.id)]?.pending)}
       onCancel={() => setPendingDelete(null)}
       onConfirm={() => {
@@ -93,9 +94,7 @@ export function ResourceAccountList({ pluginId, resource, manager, onAction }: {
           await appStore.readPlugins(true);
         });
       }}
-    >
-      <p>{t("确定删除账号 {name} 吗？删除后需要重新添加才能使用。", { name: pendingDelete.displayName })}</p>
-    </ConfirmDialog>}
+    />}
   </FormField>;
 }
 
