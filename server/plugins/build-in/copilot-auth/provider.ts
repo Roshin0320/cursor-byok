@@ -7,12 +7,10 @@ import type {
   ProviderResult,
   ProviderSupport,
 } from "cursor-byok:provider";
+import { HttpError, providerFailure } from "cursor-byok:provider";
 import type { ResourcePatch } from "cursor-byok:resource";
-import { HttpError as ChatHttpError, streamOpenAiChat } from "cursor-byok:protocol/openai-chat";
-import {
-  HttpError as ResponsesHttpError,
-  streamOpenAiResponses,
-} from "cursor-byok:protocol/openai-responses";
+import { streamOpenAiChat } from "cursor-byok:protocol/openai-chat";
+import { streamOpenAiResponses } from "cursor-byok:protocol/openai-responses";
 import { copilotChatHeaders, type Initiator } from "./constants.ts";
 import { copilotModels, type ModelRoute, modelRoute, reasoningEfforts } from "./models.ts";
 import {
@@ -27,8 +25,6 @@ import { AUTH_EXPIRED_MESSAGE, CopilotAuthError } from "./token.ts";
 const MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 500;
 const ONE_HOUR_MS = 60 * 60 * 1000;
-
-type HttpError = ChatHttpError | ResponsesHttpError;
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -112,7 +108,7 @@ function isQuotaError(error: HttpError): boolean {
 }
 
 function httpError(error: unknown): HttpError | null {
-  return error instanceof ChatHttpError || error instanceof ResponsesHttpError ? error : null;
+  return error instanceof HttpError ? error : null;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -133,7 +129,10 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function invalidResult(message: string, stateMessage: string): ProviderResult {
+function invalidResult(
+  message: string,
+  stateMessage: string,
+): Extract<ProviderResult, { status: "resource-error" }> {
   return {
     status: "resource-error",
     message,
@@ -141,19 +140,34 @@ function invalidResult(message: string, stateMessage: string): ProviderResult {
   };
 }
 
+function requestFailure(error: unknown): ProviderResult {
+  const failure = providerFailure(error);
+  return {
+    status: "request-error",
+    message: errorText(error),
+    ...(failure ? { failure } : {}),
+  };
+}
+
 function tokenFailure(error: unknown): ProviderResult {
   if (error instanceof CopilotAuthError) return invalidResult(error.message, error.message);
-  return { status: "request-error", message: errorText(error) };
+  return requestFailure(error);
 }
 
 function classify(error: HttpError, data: AccountData): ProviderResult {
-  if (error.status === 401) return invalidResult(error.message, AUTH_EXPIRED_MESSAGE);
+  if (error.status === 401) {
+    return {
+      ...invalidResult(error.message, AUTH_EXPIRED_MESSAGE),
+      failure: providerFailure(error),
+    };
+  }
   if (isQuotaError(error)) {
     const now = Date.now();
     const resetAtMs = data.quota?.resetAtMs ?? null;
     return {
       status: "resource-error",
       message: error.message,
+      failure: providerFailure(error),
       patch: {
         state: {
           status: "cooling",
@@ -164,7 +178,14 @@ function classify(error: HttpError, data: AccountData): ProviderResult {
     };
   }
   // 带具体原因的 403(模型策略未启用等)只影响本次请求,不能把账号标为 invalid。
-  return { status: "request-error", message: error.message };
+  const failure = providerFailure(error);
+  return {
+    status: "request-error",
+    message: error.message,
+    failure: error.status === 403
+      ? { ...failure, kind: isBareForbidden(error.body) ? "transient" : "request", status: 403 }
+      : failure,
+  };
 }
 
 async function invoke(
@@ -233,14 +254,14 @@ async function invoke(
     } catch (error) {
       const failure = httpError(error);
       // 流内错误可能已发出部分事件,不能重试。
-      if (!failure) return finish({ status: "request-error", message: errorText(error) });
+      if (!failure) return finish(requestFailure(error));
       // HttpError 一定发生在任何事件之前,重试是安全的。
       if (failure.status === 401 && !reexchanged) {
         reexchanged = true;
         try {
           active = await ensureToken(data, context, true);
         } catch (renewError) {
-          return tokenFailure(renewError);
+          return finish(tokenFailure(renewError));
         }
         data = active.data;
         dirty = true;

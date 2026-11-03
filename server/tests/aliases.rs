@@ -170,6 +170,7 @@ fn invocation(conversation: &str, run: &str) -> ModelInvocation {
         call_id: format!("call-{run}"),
         run_id: run.into(),
         conversation_id: conversation.into(),
+        prompt_cache_enabled: true,
         provider_call_index: 1,
         request: ModelRequest {
             model: ModelSpec::new("my-smart"),

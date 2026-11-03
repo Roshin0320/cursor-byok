@@ -1,18 +1,26 @@
 import type { JsonValue, PluginContext } from "cursor-byok:plugin";
 import type { ModelSnapshot } from "cursor-byok:model";
+import { HttpError as ProviderHttpError, ProviderError } from "cursor-byok:provider";
 import type { LlmContentPart, LlmRequest, ModelUsage, ProviderOutput } from "cursor-byok:provider";
 
 const REPLAY_KIND = "claude_oauth";
 
 /** Safe classification only: upstream response bodies and error messages are never retained. */
-export class HttpError extends Error {
+export class HttpError extends ProviderError {
   readonly headers: Record<string, string>;
   constructor(
     readonly status: number,
     headers: Record<string, string>,
     readonly errorType?: string,
   ) {
-    super(`Anthropic Messages request failed (HTTP ${status})`);
+    super(
+      `Anthropic Messages request failed (HTTP ${status})`,
+      new ProviderHttpError(
+        status,
+        JSON.stringify({ error: { type: errorType } }),
+        headers,
+      ).failure,
+    );
     this.name = "HttpError";
     // Retain retry timing, not arbitrary upstream headers that may contain credentials.
     this.headers = Object.fromEntries(

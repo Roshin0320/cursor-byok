@@ -5,6 +5,7 @@ import type {
   PluginContext,
 } from "cursor-byok:plugin";
 import type { ModelSnapshot } from "cursor-byok:model";
+import { ProviderError } from "cursor-byok:provider";
 import type { LlmMessage, LlmRequest, ModelEvent } from "cursor-byok:provider";
 import type { ResourceSnapshot } from "cursor-byok:resource";
 import {
@@ -601,6 +602,7 @@ Deno.test("403 with a concrete reason is a request error and keeps the account u
   assertEquals(calls, 1);
   assert(result.status === "request-error");
   assert(result.message.includes("not enabled by policy"));
+  assertEquals(result.failure, { kind: "request", status: 403 });
   assertEquals(result.patch, undefined);
 });
 
@@ -625,11 +627,50 @@ Deno.test("premium quota 429 cools the account after retries", async () => {
   );
   assertEquals(calls, 3);
   assert(result.status === "resource-error");
+  assertEquals(result.failure, { kind: "rate_limit", status: 429 });
   assertEquals(result.patch.state, {
     status: "cooling",
     retryAtMs: resetAtMs,
     message: "Copilot premium requests are exhausted",
   });
+});
+
+Deno.test("typed failures preserve renewed tokens and Copilot-specific HTTP dispositions", async () => {
+  for (const model of [chatModel, responsesModel]) {
+    for (const status of [503, 429, 403, 0, -1]) {
+      let calls = 0;
+      const result = await copilotProvider.invoke(
+        { model, resource: snapshot(account({ copilotTokenExpiresAtMs: 0 })), request: request() },
+        output(),
+        context({
+          fetch: () => tokenResponse("rotated"),
+          stream: () => {
+            calls++;
+            if (status === 0) {
+              throw new ProviderError("opaque network failure", { kind: "transient" });
+            }
+            if (status === -1) throw new Error("HTTP 429: quota exhausted");
+            return {
+              ...streamOf(status, status === 403 ? ["forbidden"] : ["opaque"]),
+              headers: { "retry-after": "2" },
+            };
+          },
+        }),
+      );
+      assert(result.status === "request-error");
+      assertEquals(
+        result.failure,
+        status === -1 ? undefined : status === 0 ? { kind: "transient" } : {
+          kind: status === 429 ? "rate_limit" : "transient",
+          status,
+          retryAfterMs: 2000,
+        },
+      );
+      assertEquals((result.patch?.privateData as unknown as AccountData).copilotToken, "rotated");
+      assertEquals(calls, status > 0 ? 3 : 1);
+      assertEquals(result.patch?.state, undefined);
+    }
+  }
 });
 
 Deno.test("in-stream errors are not retried", async () => {

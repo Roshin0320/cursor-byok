@@ -5,6 +5,7 @@ import type {
   NetworkResponse,
   PluginContext,
 } from "cursor-byok:plugin";
+import { ProviderError } from "cursor-byok:provider";
 import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
 import type { ResourceSnapshot } from "cursor-byok:resource";
 import {
@@ -314,6 +315,11 @@ Deno.test("expired token is refreshed before inference and persisted even on HTT
   equal(result.status, "resource-error");
   assert(result.patch?.state?.status === "cooling");
   assert(result.patch.state.retryAtMs! > Date.now() + 119_000);
+  equal(result.status !== "completed" && result.failure, {
+    kind: "rate_limit",
+    status: 429,
+    retryAfterMs: 120_000,
+  });
   equal((result.patch.privateData as Record<string, JsonValue>).refreshToken, "new-refresh-secret");
 });
 
@@ -347,6 +353,7 @@ Deno.test("HTTP 403 reports denied access without a refresh or silent fallback",
   }, context({ stream: () => stream(403) }));
   equal(result.status, "resource-error");
   assert(result.status === "resource-error" && result.message.includes("blocked"));
+  equal(result.failure, { kind: "authorization", status: 403 });
 });
 
 Deno.test("HTTP 503 refresh failure does not invalidate an account", async () => {
@@ -387,6 +394,39 @@ Deno.test("stream failure after refresh retains replacement credentials without 
   assert(result.patch?.privateData);
   equal(requests, 1);
   assert(result.status !== "completed" && !result.message.includes("access-secret"));
+});
+
+Deno.test("typed HTTP and network failures retain rotated credentials without message guessing", async () => {
+  for (const kind of ["http", "network", "untyped"] as const) {
+    let calls = 0;
+    const result = await claudeProvider.invoke(
+      { model, resource: resource(true), request: request() },
+      { emit: () => {} },
+      context({
+        fetch: () => response(tokens()),
+        stream: () => {
+          calls++;
+          if (kind === "network") throw new ProviderError("opaque", { kind: "transient" });
+          if (kind === "untyped") throw new Error("HTTP 429: rate limit");
+          return stream(503);
+        },
+      }),
+    );
+    assert(result.status === "request-error");
+    equal(
+      result.failure,
+      kind === "http"
+        ? { kind: "transient", status: 503 }
+        : kind === "network"
+        ? { kind: "transient" }
+        : undefined,
+    );
+    equal(
+      (result.patch?.privateData as Record<string, JsonValue>).refreshToken,
+      "new-refresh-secret",
+    );
+    equal(calls, 1);
+  }
 });
 
 Deno.test("retry-after supports seconds, HTTP dates, and malformed headers", () => {

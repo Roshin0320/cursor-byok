@@ -1,4 +1,5 @@
-import type { ProviderResult, ProviderSupport } from "cursor-byok:provider";
+import { providerFailure } from "cursor-byok:provider";
+import type { ProviderFailure, ProviderResult, ProviderSupport } from "cursor-byok:provider";
 import type { ResourcePatch, ResourceState } from "cursor-byok:resource";
 import {
   type AccountData,
@@ -67,9 +68,14 @@ export const claudeProvider: ProviderSupport = {
       patch = { privateData: privateData(data), state: { status: "ready" } };
       refreshed = true;
     };
-    const failResource = (message: string, state: ResourceState): ProviderResult => ({
+    const failResource = (
+      message: string,
+      state: ResourceState,
+      failure?: ProviderFailure,
+    ): ProviderResult => ({
       status: "resource-error",
       message,
+      ...(failure ? { failure } : {}),
       patch: { ...patch, state },
     });
     try {
@@ -100,6 +106,7 @@ export const claudeProvider: ProviderSupport = {
       }
       return { status: "completed", ...(patch ? { patch } : {}) };
     } catch (error) {
+      const failure = providerFailure(error);
       if (error instanceof OAuthError && error.invalidCredentials) {
         return failResource(error.message, { status: "invalid", message: error.message });
       }
@@ -108,7 +115,7 @@ export const claudeProvider: ProviderSupport = {
           const message = error.status === 401
             ? "Claude authorization was rejected. Sign in again."
             : "Claude denied API access. Check your subscription; third-party OAuth may be blocked.";
-          return failResource(message, { status: "invalid", message });
+          return failResource(message, { status: "invalid", message }, failure);
         }
         if (error.status === 429) {
           const message = "Claude usage is temporarily limited. Wait before trying again.";
@@ -116,7 +123,7 @@ export const claudeProvider: ProviderSupport = {
             status: "cooling",
             retryAtMs: retryAtMs(error.headers),
             message,
-          });
+          }, failure);
         }
       }
       const message = context.signal.aborted
@@ -125,7 +132,12 @@ export const claudeProvider: ProviderSupport = {
         ? error.message
         : "Claude request failed or its response was incomplete. Check the connection and retry.";
       // Rotated credentials must survive upstream errors as well as successful requests.
-      return { status: "request-error", message, ...(patch ? { patch } : {}) };
+      return {
+        status: "request-error",
+        message,
+        ...(failure ? { failure } : {}),
+        ...(patch ? { patch } : {}),
+      };
     }
   },
 };

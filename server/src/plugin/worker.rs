@@ -848,7 +848,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let params =
             serde_json::json!({"url": format!("https://{}", listener.local_addr().unwrap())});
-        let (request, _, _) = host.request("alias", &params).await.unwrap();
+        let (request, _, _) = host.request("alias", &params, false).await.unwrap();
         let error = tokio::time::timeout(Duration::from_secs(2), request.send())
             .await
             .expect("alias connect timeout must expire first")
@@ -860,7 +860,7 @@ mod tests {
                 .kind,
             crate::provider::failure::FailureKind::Transient
         );
-        let (request, _, _) = host.request("invocation", &params).await.unwrap();
+        let (request, _, _) = host.request("invocation", &params, false).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(150), request.send())
                 .await
@@ -893,12 +893,12 @@ mod tests {
             "losing attempt must not cancel the next attempt"
         );
         assert!(matches!(
-            host.request("invocation", &network_params()).await,
+            host.request("invocation", &network_params(), false).await,
             Err(Error::Cancelled)
         ));
         host.invocations.lock().await.remove("invocation");
         assert!(matches!(
-            host.request("invocation", &network_params()).await,
+            host.request("invocation", &network_params(), false).await,
             Err(Error::Cancelled)
         ));
     }
