@@ -238,10 +238,7 @@ async fn bidi_handler(
     let trace_metadata = decoded.trace_metadata();
     let trace = registry.trace(&decoded.request_id);
     let local = if let Some(model_id) = decoded.model_id() {
-        // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
-        if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
-            || registry.store().model(model_id).await?.is_some()
-        {
+        if is_local_model(registry.store(), model_id).await? {
             tracing::info!(
                 request_id = decoded.request_id,
                 model_id,
@@ -366,6 +363,13 @@ async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts,
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok((parts, body))
+}
+
+/// Configured models and plugin adapters are served locally.
+pub(crate) async fn is_local_model(store: &crate::store::Store, model_id: &str) -> Result<bool> {
+    // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
+    Ok(model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
+        || store.model(model_id).await?.is_some())
 }
 
 fn parent_headers(headers: &HeaderMap) -> Result<Option<TransportParent>> {
