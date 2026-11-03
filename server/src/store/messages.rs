@@ -105,6 +105,25 @@ impl Store {
     }
 }
 
+fn role_name(role: &crate::model::Role) -> &'static str {
+    match role {
+        crate::model::Role::System => "system",
+        crate::model::Role::User => "user",
+        crate::model::Role::Assistant => "assistant",
+        crate::model::Role::Tool => "tool",
+    }
+}
+
+fn origin_name(origin: &crate::model::Origin) -> &'static str {
+    match origin {
+        crate::model::Origin::Prompt => "prompt",
+        crate::model::Origin::User => "user",
+        crate::model::Origin::Runtime => "runtime",
+        crate::model::Origin::Assistant => "assistant",
+        crate::model::Origin::Tool => "tool",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,24 +179,5 @@ mod tests {
             "checkpoint history must use indexed lookups: {details:?}"
         );
         assert!(!details.iter().any(|detail| detail.starts_with("SCAN rm")));
-    }
-}
-
-fn role_name(role: &crate::model::Role) -> &'static str {
-    match role {
-        crate::model::Role::System => "system",
-        crate::model::Role::User => "user",
-        crate::model::Role::Assistant => "assistant",
-        crate::model::Role::Tool => "tool",
-    }
-}
-
-fn origin_name(origin: &crate::model::Origin) -> &'static str {
-    match origin {
-        crate::model::Origin::Prompt => "prompt",
-        crate::model::Origin::User => "user",
-        crate::model::Origin::Runtime => "runtime",
-        crate::model::Origin::Assistant => "assistant",
-        crate::model::Origin::Tool => "tool",
     }
 }
