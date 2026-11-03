@@ -656,6 +656,7 @@ fn spawn_run_request(
                 compile::PrepareDependencies {
                     compiler: &dependencies.compiler,
                     store: &dependencies.store,
+                    aliases: dependencies.provider.alias_resolver(),
                     checkpoint: &checkpoint,
                     blob_sync: &blob_sync,
                     context_sync: &context_sync,

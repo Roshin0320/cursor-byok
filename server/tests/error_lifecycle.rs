@@ -710,6 +710,7 @@ async fn account_failures_follow_explicit_retry_policy() {
             // 401 is normally terminal; a confirmed account switch permits retry.
             message: "HTTP 401: account authorization expired".into(),
             retryable,
+            failure: None,
         });
         if retryable {
             provider.push(vec![

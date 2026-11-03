@@ -16,7 +16,15 @@ pub enum Error {
     #[error("provider error: {0}")]
     Provider(String),
     #[error("account error: {message}")]
-    Resource { message: String, retryable: bool },
+    Resource {
+        message: String,
+        retryable: bool,
+        failure: Option<crate::provider::failure::ProviderFailure>,
+    },
+    #[error("{0}")]
+    Upstream(crate::provider::failure::ProviderFailure),
+    #[error("{0}")]
+    Alias(String),
     #[error("store error: {0}")]
     Store(String),
     #[error("run was cancelled")]
@@ -50,7 +58,11 @@ impl IntoResponse for Error {
                 StatusCode::BAD_REQUEST
             }
             Self::RunNotFound(_) => StatusCode::NOT_FOUND,
-            Self::Provider(_) | Self::Resource { .. } | Self::Http(_) => StatusCode::BAD_GATEWAY,
+            Self::Provider(_)
+            | Self::Resource { .. }
+            | Self::Upstream(_)
+            | Self::Alias(_)
+            | Self::Http(_) => StatusCode::BAD_GATEWAY,
             Self::Cancelled => StatusCode::CONFLICT,
             Self::Store(_)
             | Self::Database(_)

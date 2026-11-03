@@ -365,11 +365,12 @@ async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts,
     Ok((parts, body))
 }
 
-/// Configured models and plugin adapters are served locally.
+/// Configured models, plugin adapters, and aliases are served locally.
 pub(crate) async fn is_local_model(store: &crate::store::Store, model_id: &str) -> Result<bool> {
-    // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
+    // 本地模型 ID 永远不转发到 Cursor 官方上游。
     Ok(model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
-        || store.model(model_id).await?.is_some())
+        || store.model(model_id).await?.is_some()
+        || store.is_alias_name(model_id).await?)
 }
 
 fn parent_headers(headers: &HeaderMap) -> Result<Option<TransportParent>> {

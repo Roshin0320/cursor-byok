@@ -85,6 +85,11 @@ pub async fn consume_model_cycle(
         let event = match next {
             Ok(event) => event,
             Err(error) => {
+                // Alias owns its complete attempt budget and output boundary. The
+                // ordinary model retry loop must never restart an exhausted alias.
+                if matches!(error, crate::Error::Alias(_)) {
+                    return Err(terminal_failure(error.into(), text, reasoning, usage));
+                }
                 return Err(failure(error.into(), text, reasoning, usage));
             }
         };
@@ -504,10 +509,26 @@ mod tests {
 
     #[tokio::test]
     async fn account_retry_disposition_overrides_http_status_heuristics() {
-        for (message, retryable) in [
-            ("HTTP 429: quota exhausted", false),
-            ("HTTP 401: authorization expired", true),
-            ("no ready account is available", false),
+        for (message, retryable, structured_failure) in [
+            ("HTTP 429: quota exhausted", false, None),
+            ("HTTP 401: authorization expired", true, None),
+            ("no ready account is available", false, None),
+            (
+                "HTTP 429: quota exhausted",
+                false,
+                Some(crate::provider::failure::ProviderFailure::transient(
+                    "retry upstream",
+                )),
+            ),
+            (
+                "HTTP 401: authorization expired",
+                true,
+                Some(crate::provider::failure::ProviderFailure::http(
+                    401,
+                    &reqwest::header::HeaderMap::new(),
+                    "invalid key".into(),
+                )),
+            ),
         ] {
             let stream = Box::pin(tokio_stream::iter(vec![
                 Ok(ModelEvent::Start {
@@ -516,6 +537,7 @@ mod tests {
                 Err(crate::Error::Resource {
                     message: message.into(),
                     retryable,
+                    failure: structured_failure,
                 }),
             ]));
             let (tx, _rx) = tokio::sync::mpsc::channel(4);
@@ -524,6 +546,36 @@ mod tests {
                 .unwrap_err();
             assert_eq!(failure.retryable, retryable);
             assert_eq!(failure.failure.category(), "provider");
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_alias_is_terminal_before_and_after_output() {
+        for partial_output in [false, true] {
+            let mut events = vec![Ok(ModelEvent::Start {
+                model_call_id: "alias-attempt".into(),
+            })];
+            if partial_output {
+                events.extend([
+                    Ok(ModelEvent::TextStart),
+                    Ok(ModelEvent::TextDelta("partial".into())),
+                ]);
+            }
+            events.push(Err(crate::Error::Alias("HTTP 503: alias exhausted".into())));
+            let stream = Box::pin(tokio_stream::iter(events));
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            let failure = consume_model_cycle(stream, &tx, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(!failure.retryable);
+            assert_eq!(
+                failure.failure,
+                RunFailure::Provider("HTTP 503: alias exhausted".into())
+            );
+            assert_eq!(
+                failure.partial_text,
+                if partial_output { "partial" } else { "" }
+            );
         }
     }
 
