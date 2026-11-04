@@ -374,6 +374,7 @@ fn failure(
     usage: Option<Usage>,
 ) -> Box<ModelCycleFailure> {
     let retryable = match &failure {
+        RunFailure::Resource { retryable, .. } => *retryable,
         RunFailure::Protocol(_) => true,
         RunFailure::Provider(message) if is_rejected_request(message) => false,
         RunFailure::Provider(_) => true,
@@ -517,6 +518,22 @@ mod tests {
             None,
         );
         assert!(timeout.retryable);
+    }
+
+    #[test]
+    fn resource_retry_disposition_is_preserved() {
+        for retryable in [false, true] {
+            let result = failure(
+                RunFailure::Resource {
+                    message: "account is cooling".into(),
+                    retryable,
+                },
+                String::new(),
+                String::new(),
+                None,
+            );
+            assert_eq!(result.retryable, retryable);
+        }
     }
 
     #[test]

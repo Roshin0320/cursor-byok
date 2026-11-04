@@ -111,7 +111,10 @@ export const claudeProvider: ProviderSupport = {
           return failResource(message, { status: "invalid", message });
         }
         if (error.status === 429) {
-          const message = "Claude usage is temporarily limited. Wait before trying again.";
+          const requestId = error.headers["request-id"];
+          const message = "Claude inference was rate-limited (HTTP 429). " +
+            "This does not necessarily mean your subscription quota is exhausted. " +
+            "Wait before trying again." + (requestId ? ` Request ID: ${requestId}` : "");
           return failResource(message, {
             status: "cooling",
             retryAtMs: retryAtMs(error.headers),

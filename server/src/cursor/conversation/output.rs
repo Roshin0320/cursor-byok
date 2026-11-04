@@ -116,7 +116,9 @@ impl ConversationOutput {
             if !self.superseded.is_cancelled() {
                 self.abort_execs().await;
                 let (category, summary) = match error {
-                    Error::Provider(_) | Error::Http(_) => ("provider", error.to_string()),
+                    Error::Provider(_) | Error::Resource { .. } | Error::Http(_) => {
+                        ("provider", error.to_string())
+                    }
                     Error::Store(_) | Error::Database(_) | Error::Migration(_) => {
                         ("store", error.to_string())
                     }
@@ -1000,6 +1002,7 @@ fn cursor_error(failure: RunFailure) -> Error {
     match failure {
         RunFailure::Protocol(message) => Error::Protocol(message),
         RunFailure::Provider(message) => Error::Provider(message),
+        RunFailure::Resource { message, retryable } => Error::Resource { message, retryable },
         RunFailure::Store(message) => Error::Store(message),
         RunFailure::Client(message) => Error::Protocol(message),
     }
@@ -1044,29 +1047,31 @@ pub(crate) fn finish_failed(handle: &TransportHandle, error: &Error) -> Result<(
         message,
         details: Vec::new(),
     };
-    let stream_error = match error {
-        Error::Provider(_) | Error::Http(_) => {
-            let detail = ai::ErrorDetails {
-                error: ai::error_details::Error::ProviderError as i32,
-                details: Some(ai::CustomErrorDetails {
-                    title: "Provider Error".into(),
-                    detail: error.to_string(),
-                    allow_command_links_potentially_unsafe_please_only_use_for_handwritten_trusted_markdown: Some(true),
-                    is_retryable: Some(true),
-                    show_request_id: Some(true),
-                    should_show_immediate_error: Some(false),
-                }),
-                is_expected: Some(true),
-            };
-            ConnectStreamError {
-                code: ConnectCode::Unavailable,
-                message: error.to_string(),
-                details: vec![ConnectErrorDetail {
-                    type_name: "aiserver.v1.ErrorDetails".into(),
-                    value: STANDARD_NO_PAD.encode(detail.encode_to_vec()),
-                }],
-            }
+    let provider = |retryable| {
+        let detail = ai::ErrorDetails {
+            error: ai::error_details::Error::ProviderError as i32,
+            details: Some(ai::CustomErrorDetails {
+                title: "Provider Error".into(),
+                detail: error.to_string(),
+                allow_command_links_potentially_unsafe_please_only_use_for_handwritten_trusted_markdown: Some(true),
+                is_retryable: Some(retryable),
+                show_request_id: Some(true),
+                should_show_immediate_error: Some(false),
+            }),
+            is_expected: Some(true),
+        };
+        ConnectStreamError {
+            code: ConnectCode::Unavailable,
+            message: error.to_string(),
+            details: vec![ConnectErrorDetail {
+                type_name: "aiserver.v1.ErrorDetails".into(),
+                value: STANDARD_NO_PAD.encode(detail.encode_to_vec()),
+            }],
         }
+    };
+    let stream_error = match error {
+        Error::Provider(_) | Error::Http(_) => provider(true),
+        Error::Resource { retryable, .. } => provider(*retryable),
         Error::Protocol(message) => plain(ConnectCode::InvalidArgument, message.clone()),
         Error::Decode(_) | Error::Json(_) => plain(ConnectCode::InvalidArgument, error.to_string()),
         Error::RunNotFound(_) => plain(ConnectCode::NotFound, error.to_string()),

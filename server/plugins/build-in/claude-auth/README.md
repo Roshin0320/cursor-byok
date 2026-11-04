@@ -16,7 +16,8 @@ server/
 │   ├── main.ts                   Provider and account registration
 │   ├── oauth.ts                  Browser authorization and host-owned PKCE/callback integration
 │   ├── auth.ts                   Token validation, account identity, and refresh coordination
-│   ├── resources.ts              Safe account presentation and manual credential refresh
+│   ├── resources.ts              Safe account presentation and usage/credential refresh
+│   ├── usage.ts                  Subscription usage lookup, quota metrics, and limit cooling
 │   ├── models.ts                 Paginated API model discovery and capability metadata
 │   ├── provider.ts               Invocation, credential patches, and error/limit classification
 │   ├── messages.ts               Messages serialization, streaming, and signed-thinking replay
@@ -30,8 +31,8 @@ server/
     └── worker.rs                 Keeps auxiliary HTTP fetches out of model-call recording
 ```
 
-No frontend, database schema, or provider-independent conversation changes are required. Existing
-modules are not moved or deleted.
+No database schema or provider-independent conversation changes are required. Existing modules are
+not moved or deleted.
 
 ## Authentication and invocation
 
@@ -56,6 +57,19 @@ Model invocation
   → text / thinking / tool events → host → Cursor
   → terminal result includes rotated credentials, even on handled inference errors
   → host applies the credential/state patch
+
+Usage refresh (host loop every 60 s, or the account's Refresh button)
+  → plugin rotates credentials only if they expire soon, or once after a usage 401
+  → /api/oauth/usage → `limits[]` (5-hour session, weekly all-models, weekly per-model)
+    and `extra_usage` (enabled flag, monthly spend cap, spend so far)
+  → /api/oauth/organizations/<org>/prepaid/credits → prepaid usage-credit balance
+  → private `quota` + cooling while an all-models limit is used up and extra usage is off
+  → `quotaResetAtMs`: the weekly all-models reset while every all-models limit has room, else
+    null; the host sends each request to the ready account whose quota resets first, so
+    quota that would expire unused is spent before quota that lasts longer
+  → host applies the patch only if the account did not change meanwhile
+  → account metrics: remaining percent and reset time per limit, extra usage spent of the monthly cap,
+    usage-credit balance
 ```
 
 - Authorization/token constants match inspected Claude Code and current public client
@@ -76,23 +90,31 @@ Model invocation
   persist a resource patch. If the token is expiring, refresh the account, then sync models.
 - HTTP 401 receives one refresh/retry before output starts. Stream-level errors and partially
   emitted responses are never retried by this plugin. HTTP 429 uses `Retry-After` for account
-  cooling.
-- No static model fallback, credential-file import, API-key fallback, or usage-quota estimation is
-  provided. Available models are exactly what the upstream catalog returns; entitlement can still
-  differ at inference time. The fast-latency hint is not mapped to an unverified subscription
-  feature.
+  cooling, or a 60-second local backoff if it is absent; this is not a subscription-reset estimate.
+  The error includes a validated upstream request ID when available. Remaining subscription quota
+  does not guarantee inference availability: the Messages endpoint can still return HTTP 429.
+- Quota details remain in plugin account management, not the data overview. The overview does not
+  poll plugin accounts; the host-owned usage refresh loop is independent of the overview page.
+- Quota comes from the undocumented `/api/oauth/usage` endpoint that Claude Code's `/usage` reads.
+  It rate-limits unknown clients, so the request identifies as `claude-code/<version>`. A failed
+  lookup keeps the previous quota. The credit balance comes from the prepaid-credits endpoint that
+  Claude Code's extra-usage screen reads; a failed balance lookup keeps the previous balance.
+- No static model fallback, credential-file import, API-key fallback, or local usage-quota
+  estimation is provided. Available models are exactly what the upstream catalog returns;
+  entitlement can still differ at inference time. The fast-latency hint is not mapped to an
+  unverified subscription feature.
 
 ## Upstream compatibility limitation
 
 The plugin sends Bearer authorization, `anthropic-version: 2023-06-01`, and
-`anthropic-beta: oauth-2025-04-20`. It preserves user instructions and exact tool names. It **does
-not impersonate the official Claude Code client**, inject an official-client system identity, or
-forge a Claude CLI version.
+`anthropic-beta: oauth-2025-04-20`. Following upstream PR #493 commit `945527d`, it prepends the
+fixed system block `You are Claude Code, Anthropic's official CLI for Claude.` before the original
+user instructions, which remain a separate, unchanged block. That upstream commit reports the prefix
+as required for Opus subscription calls. This plugin does not forge a Claude CLI version for inference.
 
-A live Haiku request succeeded without these transformations on 2026-09-30. That result does not
-establish compatibility with every model or account. Anthropic may still reject third-party
-subscription requests, so the plugin reports upstream refusals rather than treating OAuth login as a
-guarantee of inference access.
+A live Haiku request succeeded without the prefix on 2026-09-30. That result does not establish
+compatibility with every model or account. OAuth login and quota lookup do not guarantee inference
+access; a successful live request is required to verify compatibility for the selected account/model.
 
 ## Install and try
 
@@ -133,8 +155,8 @@ deno task test
 deno task test:host
 ```
 
-The 32 unit tests use mocked networking and need no tokens or network permissions. The separate
-worker integration test starts the actual SDK worker with the host's sandbox flags and drives OAuth
+The unit tests use mocked networking and need no tokens or network permissions. The separate worker
+integration test starts the actual SDK worker with the host's sandbox flags and drives OAuth
 completion, profile lookup, model discovery, automatic token refresh, streaming events, and
 credential patches through its JSON protocol. Its parent test process needs subprocess and read
 permissions; the child has only plugin/SDK read access and no direct network access. All upstream

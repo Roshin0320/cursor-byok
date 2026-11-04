@@ -4,6 +4,10 @@ import type { LlmContentPart, LlmRequest, ModelUsage, ProviderOutput } from "cur
 
 const REPLAY_KIND = "claude_oauth";
 
+/** Subscription OAuth compatibility prefix used by upstream PR #493. */
+export const CLAUDE_CODE_SYSTEM_PROMPT =
+  "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /** Safe classification only: upstream response bodies and error messages are never retained. */
 export class HttpError extends Error {
   readonly headers: Record<string, string>;
@@ -14,10 +18,13 @@ export class HttpError extends Error {
   ) {
     super(`Anthropic Messages request failed (HTTP ${status})`);
     this.name = "HttpError";
-    // Retain retry timing, not arbitrary upstream headers that may contain credentials.
+    // Retain retry timing and a validated support ID, never arbitrary upstream headers.
     this.headers = Object.fromEntries(
       Object.entries(headers)
-        .filter(([name]) => name.toLowerCase() === "retry-after")
+        .filter(([name, value]) =>
+          name.toLowerCase() === "retry-after" ||
+          (name.toLowerCase() === "request-id" && /^req_[A-Za-z0-9]{1,128}$/.test(value))
+        )
         .map(([name, value]) => [name.toLowerCase(), value]),
     );
   }
@@ -96,9 +103,13 @@ export function buildMessagesBody(model: ModelSnapshot, request: LlmRequest): Ob
     requested && requested > 0 ? requested : 8192,
     maximum && maximum > 0 ? maximum : Number.MAX_SAFE_INTEGER,
   );
+  const system: JsonValue[] = [{ type: "text", text: CLAUDE_CODE_SYSTEM_PROMPT }];
+  if (request.instructions.length > 0) {
+    system.push({ type: "text", text: request.instructions });
+  }
   const body: ObjectValue = {
     model: model.id,
-    system: request.instructions,
+    system,
     messages,
     max_tokens: maxTokens,
     stream: true,

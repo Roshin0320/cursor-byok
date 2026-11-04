@@ -1,5 +1,8 @@
 //! Owns core-side persistence of plugin resources and model catalogs.
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use super::data::PluginDataStore;
 use crate::{Error, Result};
@@ -39,6 +42,9 @@ pub struct ResourceRecord {
     pub key: String,
     pub private_data: serde_json::Value,
     pub state: ResourceState,
+    /// When the resource's included quota expires unused, as last reported by the plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reset_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -92,6 +98,18 @@ pub struct ResourcePatch {
     pub private_data: Option<serde_json::Value>,
     #[serde(default)]
     pub state: Option<ResourceStateInput>,
+    /// Absent keeps the stored reset; `null` clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub quota_reset_at_ms: Option<Option<i64>>,
+}
+
+/// Tells an explicit `null` (`Some(None)`) apart from an absent field (`None`).
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// SDK 侧 camelCase 状态输入,转换成核心存储形状。
@@ -210,6 +228,8 @@ impl StoredModel {
 #[derive(Clone)]
 pub struct PluginStateStore {
     data: PluginDataStore,
+    /// Serializes read-modify-write of resource lists so concurrent patches cannot drop each other.
+    resource_writes: Arc<Mutex<()>>,
 }
 
 pub struct UpsertOutcome {
@@ -219,7 +239,10 @@ pub struct UpsertOutcome {
 
 impl PluginStateStore {
     pub fn new(data: PluginDataStore) -> Self {
-        Self { data }
+        Self {
+            data,
+            resource_writes: Arc::default(),
+        }
     }
 
     pub async fn resources(
@@ -243,6 +266,7 @@ impl PluginStateStore {
         resource_type: &str,
         drafts: Vec<ResourceDraft>,
     ) -> Result<UpsertOutcome> {
+        let _write = self.resource_writes.lock().await;
         let mut records = self.resources(plugin_id, resource_type).await?;
         let now = now_ms();
         let mut outcome = UpsertOutcome {
@@ -269,6 +293,7 @@ impl PluginStateStore {
                         key: draft.key,
                         private_data: draft.private_data,
                         state,
+                        quota_reset_at_ms: None,
                         created_at_ms: now,
                         updated_at_ms: now,
                     });
@@ -288,20 +313,39 @@ impl PluginStateStore {
         resource_id: &str,
         patch: ResourcePatch,
     ) -> Result<()> {
+        let _write = self.resource_writes.lock().await;
         let mut records = self.resources(plugin_id, resource_type).await?;
         let record = records
             .iter_mut()
             .find(|record| record.id == resource_id)
             .ok_or_else(|| Error::RunNotFound(format!("plugin resource {resource_id}")))?;
-        if let Some(private_data) = patch.private_data {
-            record.private_data = private_data;
-        }
-        if let Some(state) = patch.state {
-            record.state = state.into();
-        }
-        record.updated_at_ms = now_ms();
+        patch_record(record, patch);
         self.save_resources(plugin_id, resource_type, &records)
             .await
+    }
+
+    /// Applies a patch computed from `expected` only while the stored record still matches it,
+    /// so a slow refresh cannot overwrite credentials another writer replaced meanwhile.
+    pub async fn apply_patch_if_current(
+        &self,
+        plugin_id: &str,
+        resource_type: &str,
+        expected: &ResourceRecord,
+        patch: ResourcePatch,
+    ) -> Result<bool> {
+        let _write = self.resource_writes.lock().await;
+        let mut records = self.resources(plugin_id, resource_type).await?;
+        let Some(record) = records.iter_mut().find(|record| {
+            record.id == expected.id
+                && record.updated_at_ms == expected.updated_at_ms
+                && record.private_data == expected.private_data
+        }) else {
+            return Ok(false);
+        };
+        patch_record(record, patch);
+        self.save_resources(plugin_id, resource_type, &records)
+            .await?;
+        Ok(true)
     }
 
     pub async fn remove_resource(
@@ -310,6 +354,7 @@ impl PluginStateStore {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceRecord> {
+        let _write = self.resource_writes.lock().await;
         let mut records = self.resources(plugin_id, resource_type).await?;
         let index = records
             .iter()
@@ -397,6 +442,19 @@ impl PluginStateStore {
     }
 }
 
+fn patch_record(record: &mut ResourceRecord, patch: ResourcePatch) {
+    if let Some(private_data) = patch.private_data {
+        record.private_data = private_data;
+    }
+    if let Some(state) = patch.state {
+        record.state = state.into();
+    }
+    if let Some(quota_reset_at_ms) = patch.quota_reset_at_ms {
+        record.quota_reset_at_ms = quota_reset_at_ms;
+    }
+    record.updated_at_ms = now_ms();
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -461,11 +519,11 @@ mod tests {
                 "account",
                 &records[0].id,
                 ResourcePatch {
-                    private_data: None,
                     state: Some(ResourceStateInput::Cooling {
                         retry_at_ms: Some(200),
                         message: None,
                     }),
+                    ..ResourcePatch::default()
                 },
             )
             .await
@@ -473,6 +531,90 @@ mod tests {
         let records = store.resources("dev.example", "account").await.unwrap();
         assert!(!records[0].state.is_ready(100));
         assert!(records[0].state.is_ready(300), "cooling expires over time");
+    }
+
+    #[tokio::test]
+    async fn conditional_patch_skips_a_record_changed_since_its_snapshot() {
+        let (_root, store) = store();
+        let draft = |token: &str| ResourceDraft {
+            key: "acct-1".into(),
+            private_data: serde_json::json!({ "token": token }),
+            state: None,
+        };
+        store
+            .upsert_resources("dev.example", "account", vec![draft("old")])
+            .await
+            .unwrap();
+        let snapshot = store.resources("dev.example", "account").await.unwrap()[0].clone();
+        store
+            .upsert_resources("dev.example", "account", vec![draft("rotated")])
+            .await
+            .unwrap();
+        let stale = ResourcePatch {
+            private_data: Some(serde_json::json!({ "token": "old", "quota": 1 })),
+            ..ResourcePatch::default()
+        };
+        assert!(!store
+            .apply_patch_if_current("dev.example", "account", &snapshot, stale)
+            .await
+            .unwrap());
+        let current = store.resources("dev.example", "account").await.unwrap()[0].clone();
+        assert_eq!(current.private_data["token"], "rotated");
+
+        let fresh = ResourcePatch {
+            private_data: Some(serde_json::json!({ "token": "rotated", "quota": 2 })),
+            ..ResourcePatch::default()
+        };
+        assert!(store
+            .apply_patch_if_current("dev.example", "account", &current, fresh)
+            .await
+            .unwrap());
+        let records = store.resources("dev.example", "account").await.unwrap();
+        assert_eq!(records[0].private_data["quota"], 2);
+    }
+
+    #[tokio::test]
+    async fn patches_keep_the_quota_reset_unless_they_set_or_clear_it() {
+        let (_root, store) = store();
+        store
+            .upsert_resources(
+                "dev.example",
+                "account",
+                vec![ResourceDraft {
+                    key: "acct-1".into(),
+                    private_data: serde_json::json!({}),
+                    state: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let id = store.resources("dev.example", "account").await.unwrap()[0]
+            .id
+            .clone();
+        let apply = |patch: serde_json::Value| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let patch = serde_json::from_value(patch).unwrap();
+                store
+                    .apply_patch("dev.example", "account", &id, patch)
+                    .await
+                    .unwrap();
+                store.resources("dev.example", "account").await.unwrap()[0].quota_reset_at_ms
+            }
+        };
+        assert_eq!(
+            apply(serde_json::json!({ "quotaResetAtMs": 500 })).await,
+            Some(500)
+        );
+        assert_eq!(
+            apply(serde_json::json!({ "state": { "status": "ready" } })).await,
+            Some(500)
+        );
+        assert_eq!(
+            apply(serde_json::json!({ "quotaResetAtMs": null })).await,
+            None
+        );
     }
 
     #[tokio::test]

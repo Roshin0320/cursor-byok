@@ -1,7 +1,12 @@
 import type { JsonValue, NetworkEventStream, PluginContext } from "cursor-byok:plugin";
 import type { ModelSnapshot } from "cursor-byok:model";
 import type { LlmRequest, ModelEvent } from "cursor-byok:provider";
-import { buildMessagesBody, HttpError, streamMessages } from "./messages.ts";
+import {
+  buildMessagesBody,
+  CLAUDE_CODE_SYSTEM_PROMPT,
+  HttpError,
+  streamMessages,
+} from "./messages.ts";
 
 function assert(value: unknown, message = "assertion failed"): asserts value {
   if (!value) throw new Error(message);
@@ -107,7 +112,10 @@ Deno.test("messages preserve append-only prefix, system content, and exact tool 
   const after = buildMessagesBody(model, next);
   equal((after.messages as JsonValue[]).slice(0, 2), before.messages);
   equal(after.system, before.system);
-  equal(before.system, first.instructions);
+  equal(before.system, [
+    { type: "text", text: CLAUDE_CODE_SYSTEM_PROMPT },
+    { type: "text", text: first.instructions },
+  ]);
   equal(before.messages, [
     { role: "user", content: [{ type: "text", text: "context A" }] },
     { role: "user", content: [{ type: "text", text: "hello" }] },
@@ -121,6 +129,21 @@ Deno.test("messages preserve append-only prefix, system content, and exact tool 
   assert(!JSON.stringify(after).includes("not signed"));
   next.messages.push({ role: "system", content: [{ type: "text", text: "context A" }] });
   equal((buildMessagesBody(model, next).messages as JsonValue[]).slice(0, 5), after.messages);
+});
+
+Deno.test("OAuth system prefix is stable and empty instructions add no empty block", () => {
+  const req = request();
+  req.instructions = "";
+  equal(buildMessagesBody(model, req).system, [
+    { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+  ]);
+  equal(req.instructions, "");
+  req.instructions = "  Exact instructions\nwith whitespace.  ";
+  equal(buildMessagesBody(model, req).system, [
+    { type: "text", text: CLAUDE_CODE_SYSTEM_PROMPT },
+    { type: "text", text: req.instructions },
+  ]);
+  equal(req.instructions, "  Exact instructions\nwith whitespace.  ");
 });
 
 Deno.test("messages serialize user images and rich failed tool results", () => {
@@ -323,14 +346,21 @@ Deno.test("HTTP and SSE errors retain safe status and Retry-After, not upstream 
       },
       context({
         status: 429,
-        headers: { "retry-after": "30" },
+        headers: {
+          "retry-after": "30",
+          "Request-ID": "req_test123",
+          "set-cookie": "secret-cookie",
+          "authorization": "Bearer secret-token",
+        },
         lines: lines(["secret upstream body"]),
       }),
     )
   );
   assert(http instanceof HttpError);
   equal(http.status, 429);
-  equal(http.headers["retry-after"], "30");
+  equal(http.headers, { "retry-after": "30", "request-id": "req_test123" });
+  equal(new HttpError(429, { "request-id": "Bearer secret-token" }).headers, {});
+  equal(new HttpError(429, { "request-id": "req_bad\nsecret" }).headers, {});
   assert(!String(http).includes("secret"));
   assert(!("body" in http));
   const sse = await rejects(() =>

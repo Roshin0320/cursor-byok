@@ -20,6 +20,7 @@ import { claudeOAuth } from "./oauth.ts";
 import { claudeAccounts } from "./resources.ts";
 import { claudeModels } from "./models.ts";
 import { claudeProvider, retryAtMs } from "./provider.ts";
+import { parseUsage, quotaResetAtMs } from "./usage.ts";
 
 function assert(condition: unknown, message = "assertion failed"): asserts condition {
   if (!condition) throw new Error(message);
@@ -89,6 +90,35 @@ function tokens(extra: Record<string, unknown> = {}) {
     account: { uuid: "account", email_address: "person@example.com" },
     organization: { uuid: "org" },
     ...extra,
+  };
+}
+/** Trimmed real `/api/oauth/usage` response. */
+function usage() {
+  return {
+    five_hour: { utilization: 18.0, resets_at: "2026-10-08T21:59:59.957393+00:00" },
+    limits: [
+      {
+        kind: "session",
+        group: "session",
+        percent: 18,
+        resets_at: "2026-10-08T21:59:59.957393+00:00",
+        scope: null,
+      },
+      {
+        kind: "weekly_all",
+        group: "weekly",
+        percent: 23,
+        resets_at: "2026-10-15T06:59:59.957415+00:00",
+        scope: null,
+      },
+      {
+        kind: "weekly_scoped",
+        group: "weekly",
+        percent: 11,
+        resets_at: "2026-10-15T06:59:59.957625+00:00",
+        scope: { model: { id: null, display_name: "Opus" }, surface: null },
+      },
+    ],
   };
 }
 function request(): LlmRequest {
@@ -317,6 +347,31 @@ Deno.test("expired token is refreshed before inference and persisted even on HTT
   equal((result.patch.privateData as Record<string, JsonValue>).refreshToken, "new-refresh-secret");
 });
 
+Deno.test("HTTP 429 with remaining quota reports inference limit and support ID without retrying", async () => {
+  const selected = resource();
+  selected.privateData = {
+    ...accountData(selected),
+    quota: parseUsage(usage()),
+  };
+  let requests = 0;
+  const result = await claudeProvider.invoke(
+    { model, resource: selected, request: request() },
+    { emit: () => {} },
+    context({
+      stream: () => {
+        requests++;
+        return stream(429, { "Request-ID": "req_test123" });
+      },
+    }),
+  );
+  equal(requests, 1);
+  assert(result.status === "resource-error");
+  assert(result.message.includes("HTTP 429"));
+  assert(result.message.includes("not necessarily"));
+  assert(result.message.includes("req_test123"));
+  assert(result.patch.state?.status === "cooling");
+});
+
 Deno.test("HTTP 401 retries once after refresh and never loops", async () => {
   let requests = 0;
   let refreshes = 0;
@@ -454,15 +509,219 @@ Deno.test("model sync refuses to rotate unpersistable credentials or fabricate a
   );
 });
 
-Deno.test("manual refresh persists rotated tokens and marks only invalid grants invalid", async () => {
+Deno.test("refresh reads usage without rotating fresh tokens", async () => {
+  const urls: string[] = [];
+  const snapshot = resource();
+  const refreshed = await claudeAccounts.refresh!(
+    snapshot,
+    context({
+      fetch: (url, init) => {
+        urls.push(url);
+        equal(init?.headers?.["user-agent"]?.startsWith("claude-code/"), true);
+        return response(usage());
+      },
+    }),
+  );
+  equal(urls, [
+    "https://api.anthropic.com/api/oauth/usage",
+    "https://api.anthropic.com/api/oauth/organizations/org/prepaid/credits",
+  ]);
+  equal(refreshed.state, { status: "ready" });
+  const data = refreshed.privateData as Record<string, JsonValue>;
+  equal(data.accessToken, (snapshot.privateData as Record<string, JsonValue>).accessToken);
+  const view = claudeAccounts.present({ ...snapshot, privateData: refreshed.privateData! });
+  equal(view.metrics?.map((metric) => [metric.id, metric.value]), [
+    ["session", 82],
+    ["weekly_all", 77],
+    ["weekly_scoped:Opus", 89],
+  ]);
+  equal(view.metrics?.[0].resetAtMs, Date.parse("2026-10-08T21:59:59.957393+00:00"));
+});
+
+Deno.test("refresh rotates expiring tokens and keeps them when usage fails", async () => {
+  const fetches: string[] = [];
+  const refreshed = await claudeAccounts.refresh!(
+    resource(true),
+    context({
+      fetch: (url) => {
+        fetches.push(url);
+        return url === TOKEN_URL ? response(tokens()) : response({}, 429);
+      },
+    }),
+  );
+  equal(fetches, [TOKEN_URL, "https://api.anthropic.com/api/oauth/usage"]);
+  equal((refreshed.privateData as Record<string, JsonValue>).refreshToken, "new-refresh-secret");
+  equal(refreshed.state, undefined);
+});
+
+Deno.test("refresh retries usage once after a rejected access token", async () => {
+  let usageCalls = 0;
   const refreshed = await claudeAccounts.refresh!(
     resource(),
-    context({ fetch: () => response(tokens()) }),
+    context({
+      fetch: (url) => {
+        if (url === TOKEN_URL) return response(tokens());
+        if (url.endsWith("/prepaid/credits")) return response(credits());
+        usageCalls++;
+        return usageCalls === 1 ? response({}, 401) : response(usage());
+      },
+    }),
   );
+  equal(usageCalls, 2);
   equal(refreshed.state, { status: "ready" });
-  assert(refreshed.privateData);
-  const invalid = await claudeAccounts.refresh!(
+  equal((refreshed.privateData as Record<string, JsonValue>).accessToken, "new-access-secret");
+});
+
+Deno.test("refresh cools an account whose all-model limit is exhausted", async () => {
+  const resetsAt = new Date(Date.now() + 3_600_000).toISOString();
+  const refreshed = await claudeAccounts.refresh!(
     resource(),
+    context({
+      fetch: () =>
+        response({
+          limits: [
+            { kind: "session", percent: 100, resets_at: resetsAt, scope: null },
+            {
+              kind: "weekly_scoped",
+              percent: 100,
+              resets_at: new Date(Date.now() + 9_000_000).toISOString(),
+              scope: { model: { display_name: "Opus" } },
+            },
+          ],
+        }),
+    }),
+  );
+  equal(refreshed.state?.status, "cooling");
+  equal(refreshed.state?.status === "cooling" && refreshed.state.retryAtMs, Date.parse(resetsAt));
+  equal(refreshed.quotaResetAtMs, null);
+});
+
+Deno.test("refresh reports the weekly reset so the host spends expiring quota first", async () => {
+  const resetsAt = new Date(Date.now() + 86_400_000).toISOString();
+  const refreshed = await claudeAccounts.refresh!(
+    resource(),
+    context({
+      fetch: () =>
+        response({
+          limits: [{ kind: "weekly_all", percent: 40, resets_at: resetsAt, scope: null }],
+        }),
+    }),
+  );
+  equal(refreshed.quotaResetAtMs, Date.parse(resetsAt));
+});
+
+Deno.test("quota reset is the weekly all-models reset while the plan has room", () => {
+  const quota = parseUsage(usage(), 0);
+  const weekly = Date.parse("2026-10-15T06:59:59.957415+00:00");
+  equal(quotaResetAtMs(quota, weekly - 1), weekly);
+  // A passed reset is unknown until the next refresh reads the following week.
+  equal(quotaResetAtMs(quota, weekly), null);
+  // With an all-models limit used up, only paid extra usage would serve the account.
+  const session = { ...quota.limits[0], usedPercent: 100 };
+  const exhausted = { ...quota, limits: [session, ...quota.limits.slice(1)] };
+  equal(quotaResetAtMs(exhausted, weekly - 1), null);
+});
+
+/** Trimmed real `/api/oauth/organizations/:org/prepaid/credits` response. */
+function credits(amount = 11063) {
+  return {
+    amount,
+    currency: "USD",
+    balance: { money: null, credits: { amount_minor: amount, exponent: 2 } },
+    auto_reload_settings: { enabled: true },
+  };
+}
+function extraUsageContext(extraUsage: Record<string, unknown>, balance: NetworkResponse) {
+  const resetsAt = new Date(Date.now() + 3_600_000).toISOString();
+  return context({
+    fetch: (url) =>
+      url.endsWith("/prepaid/credits") ? balance : response({
+        limits: [{ kind: "weekly_all", percent: 100, resets_at: resetsAt, scope: null }],
+        extra_usage: extraUsage,
+      }),
+  });
+}
+
+Deno.test("refresh reports a capped extra usage month and the credit balance", async () => {
+  const snapshot = resource();
+  const refreshed = await claudeAccounts.refresh!(
+    snapshot,
+    extraUsageContext({
+      is_enabled: false,
+      monthly_limit: 4000,
+      used_credits: 4264.0,
+      currency: "USD",
+      decimal_places: 2,
+      disabled_reason: "org_level_disabled_until",
+      spend_limit_reached: true,
+    }, response(credits())),
+  );
+  equal(refreshed.state?.status, "cooling");
+  const view = claudeAccounts.present({ ...snapshot, privateData: refreshed.privateData! });
+  equal(
+    view.metrics?.map((metric) => [
+      metric.id,
+      metric.unit,
+      metric.value,
+      metric.currency,
+      metric.limit,
+    ]),
+    [
+      ["weekly_all", "percent", 0, undefined, undefined],
+      ["extra_usage", "currency", 42.64, "USD", 40],
+      ["credits", "currency", 110.63, "USD", undefined],
+    ],
+  );
+});
+
+Deno.test("enabled extra usage keeps an exhausted plan ready", async () => {
+  const snapshot = resource();
+  const capped = await claudeAccounts.refresh!(
+    snapshot,
+    extraUsageContext(
+      { is_enabled: true, monthly_limit: 15000, used_credits: 4264, currency: "USD" },
+      response(credits()),
+    ),
+  );
+  equal(capped.state, { status: "ready" });
+  const view = claudeAccounts.present({ ...snapshot, privateData: capped.privateData! });
+  const extra = view.metrics?.find((metric) => metric.id === "extra_usage");
+  equal([extra?.value, extra?.limit], [42.64, 150]);
+
+  const uncapped = await claudeAccounts.refresh!(
+    snapshot,
+    extraUsageContext(
+      { is_enabled: true, monthly_limit: null, used_credits: 4264, currency: "USD" },
+      response(credits()),
+    ),
+  );
+  const spent = claudeAccounts.present({ ...snapshot, privateData: uncapped.privateData! })
+    .metrics?.find((metric) => metric.id === "extra_usage");
+  equal([spent?.value, spent?.limit], [42.64, undefined]);
+});
+
+Deno.test("refresh keeps the last credit balance when its lookup fails", async () => {
+  const first = resource();
+  const before = await claudeAccounts.refresh!(
+    first,
+    extraUsageContext({ is_enabled: true, currency: "USD" }, response(credits(500))),
+  );
+  const after = await claudeAccounts.refresh!(
+    { ...first, privateData: before.privateData! },
+    extraUsageContext({ is_enabled: true, currency: "USD" }, response({}, 403)),
+  );
+  const view = claudeAccounts.present({ ...first, privateData: after.privateData! });
+  equal(view.metrics?.find((metric) => metric.id === "credits")?.value, 5);
+});
+
+Deno.test("token rotation keeps the last usage reading", () => {
+  const data = { ...accountData(resource()), quota: parseUsage(usage(), 1) };
+  equal(parseTokens(tokens(), data).quota, data.quota);
+});
+
+Deno.test("refresh marks only invalid grants invalid", async () => {
+  const invalid = await claudeAccounts.refresh!(
+    resource(true),
     context({ fetch: () => response({ error: "invalid_grant" }, 400) }),
   );
   equal(invalid.state?.status, "invalid");
